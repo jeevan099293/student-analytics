@@ -1,4 +1,6 @@
-from flask import Flask
+from pathlib import Path
+
+from flask import Flask, send_from_directory
 from flask_cors import CORS
 from flask_jwt_extended import JWTManager
 from pymongo import ASCENDING, DESCENDING
@@ -15,7 +17,9 @@ from .routes.students_routes import students_bp
 
 
 def create_app() -> Flask:
-    app = Flask(__name__)
+    base_dir = Path(__file__).resolve().parents[2]
+    static_dir = base_dir / "backend" / "static"
+    app = Flask(__name__, static_folder=str(static_dir), static_url_path="/")
     app.config.from_object(Config)
 
     CORS(app)
@@ -51,5 +55,13 @@ def create_app() -> Flask:
     @app.get("/api/health")
     def health_check():
         return {"status": "ok", "service": "student-leaderboard-api"}, 200
+
+    @app.get("/")
+    def serve_index():
+        return send_from_directory(app.static_folder, "index.html")
+
+    @app.get("/<path:path>")
+    def serve_static(path: str):
+        return send_from_directory(app.static_folder, path)
 
     return app
