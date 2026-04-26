@@ -1,22 +1,19 @@
 from datetime import datetime, timedelta, timezone
 
-from bson import ObjectId
 from flask import Blueprint, request
+from sqlalchemy import func
 
 from ..auth import roles_required
 from ..db import get_db
+from ..models import DisciplineUpdate, Student
+from ..utils import parse_uuid
+
+
+analytics_bp = Blueprint("analytics", __name__)
 
 
 def _iso(dt):
     return dt.isoformat() if isinstance(dt, datetime) else None
-
-
-def _pick_snapshot_from_update(update_doc, which: str):
-    if not update_doc:
-        return None
-    if which == "previous":
-        return update_doc.get("previous") or {}
-    return update_doc.get("new") or {}
 
 
 def _trend_label(delta_score: float) -> str:
@@ -25,15 +22,6 @@ def _trend_label(delta_score: float) -> str:
     if delta_score < 0:
         return "declining"
     return "stable"
-
-analytics_bp = Blueprint("analytics", __name__)
-
-
-def _maybe_object_id(value: str):
-    try:
-        return ObjectId(value)
-    except Exception:
-        return None
 
 
 def _safe_int(value: str):
@@ -44,44 +32,39 @@ def _safe_int(value: str):
 
 
 def _admin_scope_filters():
-    """Build base filters for admin dashboards.
-
-    - college_admin is auto-scoped to its college_id
-    - Supports optional college_id/department/year filters
-    """
     from flask_jwt_extended import get_jwt
 
     claims = get_jwt()
     role = claims.get("role")
 
-    students_filters = {}
-    updates_filters = {"status": {"$in": ["applied", "approved"]}}
+    students_filters = []
+    updates_filters = [DisciplineUpdate.status.in_(["applied", "approved"])]
 
     if role == "college_admin" and claims.get("college_id"):
-        cid = _maybe_object_id(claims.get("college_id"))
+        cid = parse_uuid(claims.get("college_id"))
         if cid:
-            students_filters["college_id"] = cid
-            updates_filters["college_id"] = cid
+            students_filters.append(Student.college_id == cid)
+            updates_filters.append(DisciplineUpdate.college_id == cid)
 
     college_id = request.args.get("college_id")
     department = request.args.get("department")
     year = request.args.get("year")
 
     if college_id:
-        cid = _maybe_object_id(college_id)
+        cid = parse_uuid(college_id)
         if cid:
-            students_filters["college_id"] = cid
-            updates_filters["college_id"] = cid
+            students_filters.append(Student.college_id == cid)
+            updates_filters.append(DisciplineUpdate.college_id == cid)
 
     if department:
-        students_filters["department"] = department.strip()
-        updates_filters["department"] = department.strip()
+        students_filters.append(Student.department == department.strip())
+        updates_filters.append(DisciplineUpdate.department == department.strip())
 
     if year:
         y = _safe_int(year)
         if y is not None:
-            students_filters["year"] = y
-            updates_filters["year"] = y
+            students_filters.append(Student.year == y)
+            updates_filters.append(DisciplineUpdate.year == y)
 
     return students_filters, updates_filters
 
@@ -96,94 +79,92 @@ def analytics_dashboard():
     daily_start = now - timedelta(days=84)
     monthly_start = now - timedelta(days=365)
 
-    # KPIs from students collection
-    kpi_pipeline = [
-        {"$match": students_filters},
-        {
-            "$group": {
-                "_id": None,
-                "students": {"$sum": 1},
-                "avg_discipline_score": {"$avg": "$discipline_score"},
-                "avg_behavior": {"$avg": "$behavior"},
-                "best_rank_global": {"$min": "$rank_global"},
-                "best_rank_college": {"$min": "$rank_college"},
-            }
-        },
-    ]
-    kpi = list(db.students.aggregate(kpi_pipeline))
-    kpi = kpi[0] if kpi else {}
+    kpi = (
+        db.query(
+            func.count(Student.id),
+            func.avg(Student.discipline_score),
+            func.avg(Student.behavior),
+            func.min(Student.rank_global),
+            func.min(Student.rank_college),
+        )
+        .filter(*students_filters)
+        .first()
+    )
 
     def _r(v, nd=2):
         try:
-            return round(float(v), nd)
+            return round(float(v or 0), nd)
         except Exception:
             return 0
 
     kpis = {
-        "students": int(kpi.get("students", 0) or 0),
+        "students": int(kpi[0] or 0),
         "avg": {
-            "discipline_score": _r(kpi.get("avg_discipline_score", 0), 2),
-            "behavior": _r(kpi.get("avg_behavior", 0), 2),
+            "discipline_score": _r(kpi[1], 2),
+            "behavior": _r(kpi[2], 2),
         },
         "best": {
-            "rank_global": int(kpi.get("best_rank_global") or 0) if kpi.get("best_rank_global") is not None else None,
-            "rank_college": int(kpi.get("best_rank_college") or 0) if kpi.get("best_rank_college") is not None else None,
+            "rank_global": int(kpi[3]) if kpi[3] is not None else None,
+            "rank_college": int(kpi[4]) if kpi[4] is not None else None,
         },
     }
 
-    # Daily time series from discipline_updates (avg of new snapshot)
-    daily_pipeline = [
-        {"$match": {**updates_filters, "created_at": {"$gte": daily_start, "$lte": now}}},
-        {
-            "$group": {
-                "_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$created_at"}},
-                "updates": {"$sum": 1},
-                "avg_discipline_score": {"$avg": "$new.discipline_score"},
-                "avg_behavior": {"$avg": "$new.behavior"},
-            }
-        },
-        {"$sort": {"_id": 1}},
-    ]
-    daily = list(db.discipline_updates.aggregate(daily_pipeline))
-    daily_series = [
-        {
-            "date": d.get("_id"),
-            "updates": int(d.get("updates", 0) or 0),
-            "discipline_score": _r(d.get("avg_discipline_score", 0), 2),
-            "behavior": _r(d.get("avg_behavior", 0), 2),
-        }
-        for d in daily
-    ]
+    updates = (
+        db.query(DisciplineUpdate)
+        .filter(*updates_filters, DisciplineUpdate.created_at >= daily_start, DisciplineUpdate.created_at <= now)
+        .order_by(DisciplineUpdate.created_at.asc())
+        .all()
+    )
 
-    # Monthly behavior averages
-    monthly_pipeline = [
-        {"$match": {**updates_filters, "created_at": {"$gte": monthly_start, "$lte": now}}},
-        {
-            "$group": {
-                "_id": {"$dateToString": {"format": "%Y-%m", "date": "$created_at"}},
-                "avg_behavior": {"$avg": "$new.behavior"},
+    daily_map = {}
+    for u in updates:
+        key = u.created_at.date().isoformat()
+        if key not in daily_map:
+            daily_map[key] = {"updates": 0, "discipline_score": [], "behavior": []}
+        daily_map[key]["updates"] += 1
+        if u.new_discipline_score is not None:
+            daily_map[key]["discipline_score"].append(u.new_discipline_score)
+        if u.new_behavior is not None:
+            daily_map[key]["behavior"].append(u.new_behavior)
+
+    daily_series = []
+    for date_key in sorted(daily_map.keys()):
+        entry = daily_map[date_key]
+        ds_avg = sum(entry["discipline_score"]) / max(len(entry["discipline_score"]), 1)
+        beh_avg = sum(entry["behavior"]) / max(len(entry["behavior"]), 1)
+        daily_series.append(
+            {
+                "date": date_key,
+                "updates": int(entry["updates"]),
+                "discipline_score": _r(ds_avg, 2),
+                "behavior": _r(beh_avg, 2),
             }
-        },
-        {"$sort": {"_id": 1}},
-    ]
-    monthly = list(db.discipline_updates.aggregate(monthly_pipeline))
+        )
+
+    monthly_updates = (
+        db.query(DisciplineUpdate)
+        .filter(*updates_filters, DisciplineUpdate.created_at >= monthly_start, DisciplineUpdate.created_at <= now)
+        .order_by(DisciplineUpdate.created_at.asc())
+        .all()
+    )
+
+    monthly_map = {}
+    for u in monthly_updates:
+        key = u.created_at.strftime("%Y-%m")
+        monthly_map.setdefault(key, []).append(u.new_behavior or 0)
+
     monthly_behavior = [
-        {"month": m.get("_id"), "behavior": _r(m.get("avg_behavior", 0), 2)} for m in monthly
+        {"month": month, "behavior": _r(sum(vals) / max(len(vals), 1), 2)}
+        for month, vals in sorted(monthly_map.items())
     ]
 
-    # Trend deltas (last 7 days vs previous 7 days)
-    def _avg_last_n(items, n, key):
-        tail = items[-n:] if len(items) >= 1 else []
-        if not tail:
-            return 0
-        return sum(float(x.get(key, 0) or 0) for x in tail) / len(tail)
-
-    last7 = daily_series[-7:]
-    prev7 = daily_series[-14:-7]
     def _avg(items, key):
         if not items:
             return 0
         return sum(float(x.get(key, 0) or 0) for x in items) / len(items)
+
+    last7 = daily_series[-7:]
+    prev7 = daily_series[-14:-7]
 
     trends = {
         "weekly": {
@@ -192,8 +173,12 @@ def analytics_dashboard():
         }
     }
 
-    # Summary blocks
-    total_reports = db.discipline_updates.count_documents({**updates_filters, "created_at": {"$gte": monthly_start, "$lte": now}})
+    total_reports = (
+        db.query(DisciplineUpdate)
+        .filter(*updates_filters, DisciplineUpdate.created_at >= monthly_start, DisciplineUpdate.created_at <= now)
+        .count()
+    )
+
     improvement_rate = 0
     if len(daily_series) >= 2:
         first = daily_series[0].get("discipline_score", 0)
@@ -223,39 +208,41 @@ def recent_activity():
     db = get_db()
     _, updates_filters = _admin_scope_filters()
 
-    query = {**updates_filters}
-    items = list(db.discipline_updates.find(query).sort([("created_at", -1)]).limit(20))
+    items = (
+        db.query(DisciplineUpdate)
+        .filter(*updates_filters)
+        .order_by(DisciplineUpdate.created_at.desc())
+        .limit(20)
+        .all()
+    )
 
-    student_ids = [i.get("student_id") for i in items if i.get("student_id")]
-    students = {
-        s.get("_id"): s
-        for s in db.students.find({"_id": {"$in": student_ids}}, {"name": 1, "roll_number": 1, "department": 1, "year": 1, "college_id": 1})
-    }
+    student_ids = [i.student_id for i in items if i.student_id]
+    students = {s.id: s for s in db.query(Student).filter(Student.id.in_(student_ids)).all()}
 
     result = []
     for it in items:
-        st = students.get(it.get("student_id")) or {}
-        created_by = it.get("created_by") or {}
+        st = students.get(it.student_id) or None
+        created_by = it.created_by or {}
         result.append(
             {
-                "id": str(it.get("_id")),
-                "timestamp": _iso(it.get("applied_at") or it.get("created_at")),
+                "id": str(it.id),
+                "timestamp": _iso(it.applied_at or it.created_at),
                 "student": {
-                    "id": str(it.get("student_id")) if it.get("student_id") else None,
-                    "name": st.get("name"),
-                    "roll_number": st.get("roll_number"),
-                    "department": st.get("department"),
-                    "year": st.get("year"),
+                    "id": str(it.student_id) if it.student_id else None,
+                    "name": st.name if st else None,
+                    "roll_number": st.roll_number if st else None,
+                    "department": st.department if st else None,
+                    "year": st.year if st else None,
                 },
-                "category": it.get("category"),
-                "reason": it.get("reason"),
-                "delta": (it.get("delta") or {}).get("discipline_score"),
-                "status": it.get("status"),
+                "category": it.category,
+                "reason": it.reason,
+                "delta": it.delta_discipline_score,
+                "status": it.status,
                 "actor": {
                     "name": created_by.get("name") or "Admin",
                     "role": created_by.get("role") or "admin",
                 },
-                "suspicious": bool(it.get("suspicious")),
+                "suspicious": bool(it.suspicious),
             }
         )
 
@@ -266,28 +253,34 @@ def recent_activity():
 @roles_required("college_admin", "super_admin")
 def score_trends(student_id):
     db = get_db()
-    student = db.students.find_one({"_id": ObjectId(student_id)}, {"name": 1})
+    student_uuid = parse_uuid(student_id)
+    if not student_uuid:
+        return {"message": "Invalid student id"}, 400
+
+    student = db.query(Student).filter(Student.id == student_uuid).first()
     if not student:
         return {"message": "Student not found"}, 404
 
-    query = {
-        "student_id": student.get("_id"),
-        "status": {"$in": ["applied", "approved"]},
-    }
-    items = list(db.discipline_updates.find(query).sort([("created_at", 1)]))
+    items = (
+        db.query(DisciplineUpdate)
+        .filter(
+            DisciplineUpdate.student_id == student.id,
+            DisciplineUpdate.status.in_(["applied", "approved"]),
+        )
+        .order_by(DisciplineUpdate.created_at.asc())
+        .all()
+    )
+
     trends = []
     for item in items:
-        new_data = item.get("new") or {}
-        timestamp = item.get("applied_at") or item.get("created_at")
-        if new_data and timestamp:
-            trends.append(
-                {
-                    "timestamp": timestamp,
-                    "discipline_score": new_data.get("discipline_score"),
-                    "behavior": new_data.get("behavior"),
-                }
-            )
-    return {"student_id": student_id, "student_name": student.get("name"), "trends": trends}, 200
+        trends.append(
+            {
+                "timestamp": item.applied_at or item.created_at,
+                "discipline_score": item.new_discipline_score,
+                "behavior": item.new_behavior,
+            }
+        )
+    return {"student_id": student_id, "student_name": student.name, "trends": trends}, 200
 
 
 @analytics_bp.get("/weekly-report")
@@ -296,21 +289,32 @@ def weekly_report():
     db = get_db()
     one_week_ago = datetime.now(timezone.utc) - timedelta(days=7)
 
-    pipeline = [
-        {"$match": {"created_at": {"$gte": one_week_ago}, "status": {"$in": ["applied", "approved"]}}},
-        {
-            "$group": {
-                "_id": "$college_id",
-                "updates_count": {"$sum": 1},
-                "avg_score": {"$avg": "$new.discipline_score"},
-            }
-        },
-    ]
+    items = (
+        db.query(DisciplineUpdate)
+        .filter(
+            DisciplineUpdate.created_at >= one_week_ago,
+            DisciplineUpdate.status.in_(["applied", "approved"]),
+        )
+        .all()
+    )
 
-    report = list(db.discipline_updates.aggregate(pipeline))
-    for item in report:
-        item["college_id"] = str(item.pop("_id"))
-        item["avg_score"] = round(item.get("avg_score", 0), 2)
+    report_map = {}
+    for item in items:
+        key = str(item.college_id)
+        report_map.setdefault(key, {"updates_count": 0, "scores": []})
+        report_map[key]["updates_count"] += 1
+        report_map[key]["scores"].append(item.new_discipline_score or 0)
+
+    report = []
+    for college_id, data in report_map.items():
+        avg_score = sum(data["scores"]) / max(len(data["scores"]), 1)
+        report.append(
+            {
+                "college_id": college_id,
+                "updates_count": data["updates_count"],
+                "avg_score": round(avg_score, 2),
+            }
+        )
 
     return {"items": report}, 200
 
@@ -319,19 +323,19 @@ def weekly_report():
 @roles_required("college_admin", "super_admin")
 def badges():
     db = get_db()
-    best_discipline = db.students.find_one(sort=[("discipline_score", -1)])
-    best_behavior = db.students.find_one(sort=[("behavior", -1)])
+    best_discipline = db.query(Student).order_by(Student.discipline_score.desc()).first()
+    best_behavior = db.query(Student).order_by(Student.behavior.desc()).first()
 
     result = {
         "best_discipline": {
             "title": "Best Discipline",
-            "student": best_discipline.get("name") if best_discipline else None,
-            "score": best_discipline.get("discipline_score") if best_discipline else None,
+            "student": best_discipline.name if best_discipline else None,
+            "score": best_discipline.discipline_score if best_discipline else None,
         },
         "best_behavior": {
             "title": "Best Behavior",
-            "student": best_behavior.get("name") if best_behavior else None,
-            "score": best_behavior.get("behavior") if best_behavior else None,
+            "student": best_behavior.name if best_behavior else None,
+            "score": best_behavior.behavior if best_behavior else None,
         },
     }
     return result, 200
@@ -341,19 +345,23 @@ def badges():
 @roles_required("college_admin", "super_admin")
 def ai_suggestions(student_id):
     db = get_db()
-    student = db.students.find_one({"_id": ObjectId(student_id)})
+    student_uuid = parse_uuid(student_id)
+    if not student_uuid:
+        return {"message": "Invalid student id"}, 400
+
+    student = db.query(Student).filter(Student.id == student_uuid).first()
     if not student:
         return {"message": "Student not found"}, 404
 
     suggestions = []
-    if student.get("behavior", 0) < 70:
+    if (student.behavior or 0) < 70:
         suggestions.append("Join mentorship and behavior feedback sessions every fortnight.")
     if not suggestions:
         suggestions.append("Maintain current consistency and target leadership opportunities.")
 
     return {
         "student_id": student_id,
-        "discipline_score": student.get("discipline_score", 0),
+        "discipline_score": student.discipline_score or 0,
         "suggestions": suggestions,
     }, 200
 
@@ -361,7 +369,11 @@ def ai_suggestions(student_id):
 @analytics_bp.get("/student-report/<student_id>")
 def student_report(student_id):
     db = get_db()
-    student = db.students.find_one({"_id": ObjectId(student_id)})
+    student_uuid = parse_uuid(student_id)
+    if not student_uuid:
+        return {"message": "Invalid student id"}, 400
+
+    student = db.query(Student).filter(Student.id == student_uuid).first()
     if not student:
         return {"message": "Student not found"}, 404
 
@@ -373,32 +385,36 @@ def student_report(student_id):
     days = 7 if period == "weekly" else 30
     start_at = now - timedelta(days=days)
 
-    query = {
-        "student_id": student.get("_id"),
-        "status": {"$in": ["applied", "approved"]},
-    }
-
-    updates_in_period = list(
-        db.discipline_updates.find(
-            {**query, "created_at": {"$gte": start_at, "$lte": now}},
-        ).sort([("created_at", 1)])
+    updates_in_period = (
+        db.query(DisciplineUpdate)
+        .filter(
+            DisciplineUpdate.student_id == student.id,
+            DisciplineUpdate.status.in_(["applied", "approved"]),
+            DisciplineUpdate.created_at >= start_at,
+            DisciplineUpdate.created_at <= now,
+        )
+        .order_by(DisciplineUpdate.created_at.asc())
+        .all()
     )
 
-    baseline = db.discipline_updates.find_one(
-        {**query, "created_at": {"$lt": start_at}},
-        sort=[("created_at", -1)],
+    baseline = (
+        db.query(DisciplineUpdate)
+        .filter(
+            DisciplineUpdate.student_id == student.id,
+            DisciplineUpdate.status.in_(["applied", "approved"]),
+            DisciplineUpdate.created_at < start_at,
+        )
+        .order_by(DisciplineUpdate.created_at.desc())
+        .first()
     )
 
     if updates_in_period:
-        start_snapshot = _pick_snapshot_from_update(baseline, "new") or _pick_snapshot_from_update(
-            updates_in_period[0], "previous"
-        )
-        end_snapshot = _pick_snapshot_from_update(updates_in_period[-1], "new")
+        start_snapshot = (baseline.new if baseline else None) or (updates_in_period[0].previous or {})
+        end_snapshot = updates_in_period[-1].new or {}
     else:
-        # No changes in period; treat current as both start and end.
         start_snapshot = {
-            "behavior": student.get("behavior", 0),
-            "discipline_score": student.get("discipline_score", 0),
+            "behavior": student.behavior or 0,
+            "discipline_score": student.discipline_score or 0,
         }
         end_snapshot = dict(start_snapshot)
 
@@ -407,15 +423,15 @@ def student_report(student_id):
 
     categories = {}
     for u in updates_in_period:
-        cat = u.get("category") or "Other"
+        cat = u.category or "Other"
         categories[cat] = categories.get(cat, 0) + 1
 
     series = []
     for u in updates_in_period:
-        snapshot = u.get("new") or {}
+        snapshot = u.new or {}
         series.append(
             {
-                "timestamp": u.get("applied_at") or u.get("created_at"),
+                "timestamp": u.applied_at or u.created_at,
                 "discipline_score": snapshot.get("discipline_score"),
                 "behavior": snapshot.get("behavior"),
             }
@@ -423,19 +439,19 @@ def student_report(student_id):
 
     return {
         "student": {
-            "id": str(student.get("_id")),
-            "name": student.get("name"),
-            "roll_number": student.get("roll_number"),
-            "department": student.get("department"),
-            "year": student.get("year"),
-            "college_id": str(student.get("college_id")) if student.get("college_id") else None,
+            "id": str(student.id),
+            "name": student.name,
+            "roll_number": student.roll_number,
+            "department": student.department,
+            "year": student.year,
+            "college_id": str(student.college_id) if student.college_id else None,
         },
         "period": period,
         "start_at": _iso(start_at),
         "end_at": _iso(now),
         "current": {
-            "behavior": student.get("behavior", 0),
-            "discipline_score": student.get("discipline_score", 0),
+            "behavior": student.behavior or 0,
+            "discipline_score": student.discipline_score or 0,
         },
         "summary": {
             "updates_count": len(updates_in_period),

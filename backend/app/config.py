@@ -8,8 +8,7 @@ load_dotenv(BASE_DIR / ".env")
 
 
 class Config:
-    MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
-    MONGO_DB_NAME = os.getenv("MONGO_DB_NAME", "student_leaderboard")
+    DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+psycopg://postgres:postgres@localhost:5432/student_leaderboard")
     JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "change-this-secret")
     JWT_ACCESS_TOKEN_EXPIRES = 60 * 60 * 12
     SUPER_ADMIN_EMAIL = os.getenv("SUPER_ADMIN_EMAIL", "superadmin@example.com")

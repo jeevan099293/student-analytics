@@ -1,19 +1,27 @@
 from datetime import datetime, timezone
+from uuid import UUID
 
-from bson import ObjectId
 from flask import Blueprint, current_app, request
 from flask_jwt_extended import create_access_token, get_jwt_identity, jwt_required
 
 from ..auth import hash_password, verify_password
 from ..db import get_db
+from ..models import Admin
 from ..utils import serialize_doc
 
 auth_bp = Blueprint("auth", __name__)
 
 
+def _parse_uuid(value: str):
+    try:
+        return UUID(value)
+    except Exception:
+        return None
+
+
 def ensure_bootstrap_super_admin(db):
     email = current_app.config["SUPER_ADMIN_EMAIL"]
-    existing = db.admins.find_one({"email": email})
+    existing = db.query(Admin).filter(Admin.email == email).first()
     payload = {
         "name": "Platform Super Admin",
         "password_hash": hash_password(current_app.config["SUPER_ADMIN_PASSWORD"]),
@@ -21,18 +29,23 @@ def ensure_bootstrap_super_admin(db):
         "college_id": None,
     }
     if existing:
-        db.admins.update_one({"_id": existing["_id"]}, {"$set": payload})
+        existing.name = payload["name"]
+        existing.password_hash = payload["password_hash"]
+        existing.role = payload["role"]
+        existing.college_id = payload["college_id"]
+        db.commit()
         return
-    db.admins.insert_one(
-        {
-            "name": payload["name"],
-            "email": email,
-            "password_hash": payload["password_hash"],
-            "role": payload["role"],
-            "college_id": payload["college_id"],
-            "created_at": datetime.now(timezone.utc),
-        }
+
+    admin = Admin(
+        name=payload["name"],
+        email=email,
+        password_hash=payload["password_hash"],
+        role=payload["role"],
+        college_id=payload["college_id"],
+        created_at=datetime.now(timezone.utc),
     )
+    db.add(admin)
+    db.commit()
 
 
 @auth_bp.post("/login")
@@ -44,27 +57,27 @@ def login():
     email = data.get("email", "").strip().lower()
     password = data.get("password", "")
 
-    admin = db.admins.find_one({"email": email})
-    if not admin or not verify_password(admin.get("password_hash", ""), password):
+    admin = db.query(Admin).filter(Admin.email == email).first()
+    if not admin or not verify_password(admin.password_hash or "", password):
         return {"message": "Invalid credentials"}, 401
 
     token = create_access_token(
-        identity=str(admin["_id"]),
+        identity=str(admin.id),
         additional_claims={
-            "role": admin.get("role"),
-            "college_id": str(admin.get("college_id")) if admin.get("college_id") else None,
-            "name": admin.get("name"),
+            "role": admin.role,
+            "college_id": str(admin.college_id) if admin.college_id else None,
+            "name": admin.name,
         },
     )
 
     return {
         "access_token": token,
         "admin": {
-            "id": str(admin["_id"]),
-            "name": admin.get("name"),
-            "email": admin.get("email"),
-            "role": admin.get("role"),
-            "college_id": str(admin.get("college_id")) if admin.get("college_id") else None,
+            "id": str(admin.id),
+            "name": admin.name,
+            "email": admin.email,
+            "role": admin.role,
+            "college_id": str(admin.college_id) if admin.college_id else None,
         },
     }, 200
 
@@ -74,9 +87,12 @@ def login():
 def me():
     db = get_db()
     admin_id = get_jwt_identity()
-    admin = db.admins.find_one({"_id": ObjectId(admin_id)})
+    parsed_id = _parse_uuid(admin_id)
+    if not parsed_id:
+        return {"message": "Invalid admin id"}, 400
+    admin = db.query(Admin).filter(Admin.id == parsed_id).first()
     if not admin:
         return {"message": "Admin not found"}, 404
-    admin = serialize_doc(admin)
-    admin.pop("password_hash", None)
-    return {"admin": admin}, 200
+    admin_doc = serialize_doc(admin)
+    admin_doc.pop("password_hash", None)
+    return {"admin": admin_doc}, 200

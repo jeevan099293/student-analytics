@@ -1,16 +1,17 @@
 from datetime import datetime, timezone
 
-from bson import ObjectId
 from flask import Blueprint, current_app, request
 from flask_jwt_extended import get_jwt, get_jwt_identity
 
 from ..auth import roles_required
 from ..db import get_db
+from ..models import DisciplineUpdate, Student
 from ..utils import (
     classify_discipline_update,
     compute_discipline_delta,
     create_notification,
     normalize_discipline_metrics,
+    parse_uuid,
     recalculate_ranks,
     serialize_doc,
     validate_justification,
@@ -21,11 +22,15 @@ discipline_bp = Blueprint("discipline", __name__)
 
 
 def _scope_student_or_404(db, student_id: str, claims: dict):
-    student = db.students.find_one({"_id": ObjectId(student_id)})
+    student_uuid = parse_uuid(student_id)
+    if not student_uuid:
+        return None, ({"message": "Invalid student id"}, 400)
+
+    student = db.query(Student).filter(Student.id == student_uuid).first()
     if not student:
         return None, ({"message": "Student not found"}, 404)
 
-    if claims.get("role") == "college_admin" and str(student.get("college_id")) != claims.get("college_id"):
+    if claims.get("role") == "college_admin" and str(student.college_id) != claims.get("college_id"):
         return None, ({"message": "Forbidden"}, 403)
 
     return student, None
@@ -33,11 +38,12 @@ def _scope_student_or_404(db, student_id: str, claims: dict):
 
 def _admin_actor():
     claims = get_jwt()
+    admin_id = parse_uuid(get_jwt_identity())
     return {
-        "id": ObjectId(get_jwt_identity()),
+        "id": str(admin_id) if admin_id else None,
         "name": claims.get("name"),
         "role": claims.get("role"),
-        "college_id": ObjectId(claims["college_id"]) if claims.get("college_id") else None,
+        "college_id": claims.get("college_id"),
     }
 
 
@@ -57,8 +63,8 @@ def create_discipline_update(student_id):
     if err:
         return {"message": err}, 400
 
-    previous = normalize_discipline_metrics({}, fallback=student)
-    new = normalize_discipline_metrics(data, fallback=student)
+    previous = normalize_discipline_metrics({}, fallback=serialize_doc(student))
+    new = normalize_discipline_metrics(data, fallback=serialize_doc(student))
     delta = compute_discipline_delta(previous, new)
 
     if delta.get("behavior") == 0:
@@ -66,72 +72,72 @@ def create_discipline_update(student_id):
 
     requires_approval, suspicious, flags = classify_discipline_update(delta, current_app.config)
 
-    update_doc = {
-        "student_id": student.get("_id"),
-        "college_id": student.get("college_id"),
-        "created_at": datetime.now(timezone.utc),
-        "created_by": {
+    update_doc = DisciplineUpdate(
+        student_id=student.id,
+        college_id=student.college_id,
+        department=student.department,
+        year=student.year,
+        created_at=datetime.now(timezone.utc),
+        created_by={
             "id": actor["id"],
             "name": actor.get("name"),
             "role": actor.get("role"),
         },
-        "category": justification["category"],
-        "reason": justification["reason"],
-        "details": justification.get("details"),
-        "previous": previous,
-        "new": new,
-        "delta": delta,
-        "requires_approval": requires_approval,
-        "status": "pending" if requires_approval else "applied",
-        "reviewed_by": None,
-        "reviewed_at": None,
-        "applied_at": None,
-        "suspicious": suspicious,
-        "suspicious_flags": flags,
-    }
+        category=justification["category"],
+        reason=justification["reason"],
+        details=justification.get("details"),
+        previous=previous,
+        new=new,
+        delta=delta,
+        new_behavior=new.get("behavior"),
+        new_discipline_score=new.get("discipline_score"),
+        delta_behavior=delta.get("behavior"),
+        delta_discipline_score=delta.get("discipline_score"),
+        requires_approval=requires_approval,
+        status="pending" if requires_approval else "applied",
+        reviewed_by=None,
+        reviewed_at=None,
+        applied_at=None,
+        suspicious=suspicious,
+        suspicious_flags=flags,
+    )
 
-    insert_result = db.discipline_updates.insert_one(update_doc)
-    update_doc["_id"] = insert_result.inserted_id
+    db.add(update_doc)
+    db.flush()
 
     if requires_approval:
         create_notification(
             db,
-            student,
-            f"Discipline change pending approval for {student.get('name')} (Δ {delta.get('discipline_score')}).",
+            {"id": student.id, "college_id": student.college_id},
+            f"Discipline change pending approval for {student.name} (Δ {delta.get('discipline_score')}).",
             event_type="discipline_update_pending",
         )
+        db.commit()
         return {"update": serialize_doc(update_doc)}, 202
 
-    # Apply immediately
     applied_at = datetime.now(timezone.utc)
-    db.students.update_one(
-        {"_id": student.get("_id")},
-        {
-            "$set": {
-                "attendance": new["attendance"],
-                "behavior": new["behavior"],
-                "participation": new["participation"],
-                "discipline_score": new["discipline_score"],
-                "updated_at": applied_at,
-            }
-        },
-    )
+    student.attendance = new["attendance"]
+    student.behavior = new["behavior"]
+    student.participation = new["participation"]
+    student.discipline_score = new["discipline_score"]
+    student.updated_at = applied_at
 
-    db.discipline_updates.update_one(
-        {"_id": insert_result.inserted_id},
-        {"$set": {"applied_at": applied_at}},
-    )
+    update_doc.applied_at = applied_at
+    update_doc.status = "applied"
 
     create_notification(
         db,
-        student,
-        f"Discipline score updated for {student.get('name')} to {new['discipline_score']}.",
+        {"id": student.id, "college_id": student.college_id},
+        f"Discipline score updated for {student.name} to {new['discipline_score']}.",
         event_type="score_update",
     )
+    db.commit()
     recalculate_ranks(db)
 
-    updated_student = db.students.find_one({"_id": student.get("_id")})
-    return {"item": serialize_doc(updated_student), "update": serialize_doc({**update_doc, "applied_at": applied_at})}, 200
+    return {
+        "item": serialize_doc(student),
+        "update": serialize_doc(update_doc),
+    }, 200
 
 
 @discipline_bp.get("/students/<student_id>/discipline-updates")
@@ -144,100 +150,96 @@ def list_discipline_updates(student_id):
     if error:
         return error
 
-    query = {"student_id": student.get("_id")}
+    query = db.query(DisciplineUpdate).filter(DisciplineUpdate.student_id == student.id)
 
     category = request.args.get("category")
     if category:
-        query["category"] = category
+        query = query.filter(DisciplineUpdate.category == category)
 
     status = request.args.get("status")
     if status:
-        query["status"] = status
+        query = query.filter(DisciplineUpdate.status == status)
 
     start = request.args.get("start")
     end = request.args.get("end")
     if start or end:
-        query["created_at"] = {}
         try:
             if start:
-                query["created_at"]["$gte"] = datetime.fromisoformat(start)
+                query = query.filter(DisciplineUpdate.created_at >= datetime.fromisoformat(start))
             if end:
-                query["created_at"]["$lte"] = datetime.fromisoformat(end)
+                query = query.filter(DisciplineUpdate.created_at <= datetime.fromisoformat(end))
         except ValueError:
             return {"message": "Invalid date filter; use ISO format"}, 400
 
     direction = request.args.get("direction")
     if direction == "positive":
-        query["delta.discipline_score"] = {"$gt": 0}
+        query = query.filter(DisciplineUpdate.delta_discipline_score > 0)
     elif direction == "negative":
-        query["delta.discipline_score"] = {"$lt": 0}
+        query = query.filter(DisciplineUpdate.delta_discipline_score < 0)
 
-    items = list(db.discipline_updates.find(query).sort([("created_at", -1)]))
+    items = query.order_by(DisciplineUpdate.created_at.desc()).all()
     return {"items": [serialize_doc(x) for x in items]}, 200
 
 
 @discipline_bp.get("/students/<student_id>/discipline-history")
 def public_discipline_history(student_id):
     db = get_db()
-    student = db.students.find_one({"_id": ObjectId(student_id)}, {"_id": 1})
+    student_uuid = parse_uuid(student_id)
+    if not student_uuid:
+        return {"message": "Invalid student id"}, 400
+
+    student = db.query(Student).filter(Student.id == student_uuid).first()
     if not student:
         return {"message": "Student not found"}, 404
 
-    query = {
-        "student_id": student.get("_id"),
-        "status": {"$in": ["applied", "approved"]},
-    }
+    query = db.query(DisciplineUpdate).filter(
+        DisciplineUpdate.student_id == student.id,
+        DisciplineUpdate.status.in_(["applied", "approved"]),
+    )
 
     category = request.args.get("category")
     if category:
-        query["category"] = category
+        query = query.filter(DisciplineUpdate.category == category)
 
     start = request.args.get("start")
     end = request.args.get("end")
     if start or end:
-        query["created_at"] = {}
         try:
             if start:
-                query["created_at"]["$gte"] = datetime.fromisoformat(start)
+                query = query.filter(DisciplineUpdate.created_at >= datetime.fromisoformat(start))
             if end:
-                query["created_at"]["$lte"] = datetime.fromisoformat(end)
+                query = query.filter(DisciplineUpdate.created_at <= datetime.fromisoformat(end))
         except ValueError:
             return {"message": "Invalid date filter; use ISO format"}, 400
 
     direction = request.args.get("direction")
     if direction == "positive":
-        query["delta.discipline_score"] = {"$gt": 0}
+        query = query.filter(DisciplineUpdate.delta_discipline_score > 0)
     elif direction == "negative":
-        query["delta.discipline_score"] = {"$lt": 0}
+        query = query.filter(DisciplineUpdate.delta_discipline_score < 0)
 
-    items = list(
-        db.discipline_updates.find(
-            query,
-            {
-                "student_id": 0,
-                "college_id": 0,
-            },
-        ).sort([("created_at", -1)])
-    )
+    items = query.order_by(DisciplineUpdate.created_at.desc()).all()
 
-    # Make actor readable for students
+    results = []
     for item in items:
-        created_by = item.get("created_by") or {}
-        item["actor"] = {
+        payload = serialize_doc(item)
+        created_by = payload.get("created_by") or {}
+        payload["actor"] = {
             "name": created_by.get("name") or "Admin",
             "role": created_by.get("role") or "admin",
         }
-        item.pop("created_by", None)
+        payload.pop("created_by", None)
 
-        reviewed_by = item.get("reviewed_by") or {}
+        reviewed_by = payload.get("reviewed_by") or {}
         if reviewed_by:
-            item["reviewer"] = {
+            payload["reviewer"] = {
                 "name": reviewed_by.get("name") or "Admin",
                 "role": reviewed_by.get("role") or "admin",
             }
-        item.pop("reviewed_by", None)
+        payload.pop("reviewed_by", None)
+        results.append(payload)
 
-    return {"items": [serialize_doc(x) for x in items]}, 200
+    return {"items": results}, 200
 
 
 @discipline_bp.get("/discipline-updates/pending")
@@ -246,28 +248,31 @@ def pending_discipline_updates():
     db = get_db()
     claims = get_jwt()
 
-    query = {"status": "pending"}
+    query = db.query(DisciplineUpdate).filter(DisciplineUpdate.status == "pending")
     if claims.get("role") == "college_admin":
-        query["college_id"] = ObjectId(claims["college_id"])
+        college_uuid = parse_uuid(claims.get("college_id"))
+        if not college_uuid:
+            return {"items": []}, 200
+        query = query.filter(DisciplineUpdate.college_id == college_uuid)
 
-    items = list(db.discipline_updates.find(query).sort([("created_at", -1)]).limit(100))
+    items = query.order_by(DisciplineUpdate.created_at.desc()).limit(100).all()
 
-    # Attach student summary
-    student_ids = [item.get("student_id") for item in items if item.get("student_id")]
-    students = {
-        s.get("_id"): s
-        for s in db.students.find({"_id": {"$in": student_ids}}, {"name": 1, "roll_number": 1, "department": 1})
-    }
+    student_ids = [item.student_id for item in items if item.student_id]
+    students = {s.id: s for s in db.query(Student).filter(Student.id.in_(student_ids)).all()}
+
+    results = []
     for item in items:
-        s = students.get(item.get("student_id"))
-        item["student"] = {
-            "id": item.get("student_id"),
-            "name": (s or {}).get("name"),
-            "roll_number": (s or {}).get("roll_number"),
-            "department": (s or {}).get("department"),
+        payload = serialize_doc(item)
+        st = students.get(item.student_id)
+        payload["student"] = {
+            "id": str(item.student_id) if item.student_id else None,
+            "name": st.name if st else None,
+            "roll_number": st.roll_number if st else None,
+            "department": st.department if st else None,
         }
+        results.append(payload)
 
-    return {"items": [serialize_doc(x) for x in items]}, 200
+    return {"items": results}, 200
 
 
 @discipline_bp.post("/discipline-updates/<update_id>/approve")
@@ -277,66 +282,54 @@ def approve_discipline_update(update_id):
     claims = get_jwt()
     reviewer = _admin_actor()
 
-    update_doc = db.discipline_updates.find_one({"_id": ObjectId(update_id)})
+    update_uuid = parse_uuid(update_id)
+    if not update_uuid:
+        return {"message": "Invalid update id"}, 400
+
+    update_doc = db.query(DisciplineUpdate).filter(DisciplineUpdate.id == update_uuid).first()
     if not update_doc:
         return {"message": "Update not found"}, 404
-    if update_doc.get("status") != "pending":
+    if update_doc.status != "pending":
         return {"message": "Update is not pending"}, 400
 
-    student = db.students.find_one({"_id": update_doc.get("student_id")})
+    student = db.query(Student).filter(Student.id == update_doc.student_id).first()
     if not student:
         return {"message": "Student not found"}, 404
 
-    if claims.get("role") == "college_admin" and str(student.get("college_id")) != claims.get("college_id"):
+    if claims.get("role") == "college_admin" and str(student.college_id) != claims.get("college_id"):
         return {"message": "Forbidden"}, 403
 
-    # Prevent self-approval when possible
-    if str(update_doc.get("created_by", {}).get("id")) == str(reviewer.get("id")):
+    if str((update_doc.created_by or {}).get("id")) == str(reviewer.get("id")):
         return {"message": "You cannot approve your own discipline changes"}, 403
 
     applied_at = datetime.now(timezone.utc)
-    new = update_doc.get("new") or {}
+    new = update_doc.new or {}
 
-    db.students.update_one(
-        {"_id": student.get("_id")},
-        {
-            "$set": {
-                "attendance": new.get("attendance", student.get("attendance", 0)),
-                "behavior": new.get("behavior", student.get("behavior", 0)),
-                "participation": new.get("participation", student.get("participation", 0)),
-                "discipline_score": new.get("discipline_score", student.get("discipline_score", 0)),
-                "updated_at": applied_at,
-            }
-        },
-    )
+    student.attendance = new.get("attendance", student.attendance or 0)
+    student.behavior = new.get("behavior", student.behavior or 0)
+    student.participation = new.get("participation", student.participation or 0)
+    student.discipline_score = new.get("discipline_score", student.discipline_score or 0)
+    student.updated_at = applied_at
 
-    db.discipline_updates.update_one(
-        {"_id": update_doc.get("_id")},
-        {
-            "$set": {
-                "status": "approved",
-                "reviewed_by": {
-                    "id": reviewer["id"],
-                    "name": reviewer.get("name"),
-                    "role": reviewer.get("role"),
-                },
-                "reviewed_at": applied_at,
-                "applied_at": applied_at,
-            }
-        },
-    )
+    update_doc.status = "approved"
+    update_doc.reviewed_by = {
+        "id": reviewer["id"],
+        "name": reviewer.get("name"),
+        "role": reviewer.get("role"),
+    }
+    update_doc.reviewed_at = applied_at
+    update_doc.applied_at = applied_at
 
     create_notification(
         db,
-        student,
-        f"Discipline change approved for {student.get('name')} (Score: {new.get('discipline_score')}).",
+        {"id": student.id, "college_id": student.college_id},
+        f"Discipline change approved for {student.name} (Score: {new.get('discipline_score')}).",
         event_type="discipline_update_approved",
     )
+    db.commit()
     recalculate_ranks(db)
 
-    updated_student = db.students.find_one({"_id": student.get("_id")})
-    updated_update = db.discipline_updates.find_one({"_id": update_doc.get("_id")})
-    return {"item": serialize_doc(updated_student), "update": serialize_doc(updated_update)}, 200
+    return {"item": serialize_doc(student), "update": serialize_doc(update_doc)}, 200
 
 
 @discipline_bp.post("/discipline-updates/<update_id>/reject")
@@ -346,43 +339,40 @@ def reject_discipline_update(update_id):
     claims = get_jwt()
     reviewer = _admin_actor()
 
-    update_doc = db.discipline_updates.find_one({"_id": ObjectId(update_id)})
+    update_uuid = parse_uuid(update_id)
+    if not update_uuid:
+        return {"message": "Invalid update id"}, 400
+
+    update_doc = db.query(DisciplineUpdate).filter(DisciplineUpdate.id == update_uuid).first()
     if not update_doc:
         return {"message": "Update not found"}, 404
-    if update_doc.get("status") != "pending":
+    if update_doc.status != "pending":
         return {"message": "Update is not pending"}, 400
 
-    student = db.students.find_one({"_id": update_doc.get("student_id")})
+    student = db.query(Student).filter(Student.id == update_doc.student_id).first()
     if not student:
         return {"message": "Student not found"}, 404
 
-    if claims.get("role") == "college_admin" and str(student.get("college_id")) != claims.get("college_id"):
+    if claims.get("role") == "college_admin" and str(student.college_id) != claims.get("college_id"):
         return {"message": "Forbidden"}, 403
 
-    if str(update_doc.get("created_by", {}).get("id")) == str(reviewer.get("id")):
+    if str((update_doc.created_by or {}).get("id")) == str(reviewer.get("id")):
         return {"message": "You cannot reject your own discipline changes"}, 403
 
     rejected_at = datetime.now(timezone.utc)
-    db.discipline_updates.update_one(
-        {"_id": update_doc.get("_id")},
-        {
-            "$set": {
-                "status": "rejected",
-                "reviewed_by": {
-                    "id": reviewer["id"],
-                    "name": reviewer.get("name"),
-                    "role": reviewer.get("role"),
-                },
-                "reviewed_at": rejected_at,
-            }
-        },
-    )
+    update_doc.status = "rejected"
+    update_doc.reviewed_by = {
+        "id": reviewer["id"],
+        "name": reviewer.get("name"),
+        "role": reviewer.get("role"),
+    }
+    update_doc.reviewed_at = rejected_at
 
     create_notification(
         db,
-        student,
-        f"Discipline change rejected for {student.get('name')}.",
+        {"id": student.id, "college_id": student.college_id},
+        f"Discipline change rejected for {student.name}.",
         event_type="discipline_update_rejected",
     )
-    updated_update = db.discipline_updates.find_one({"_id": update_doc.get("_id")})
-    return {"update": serialize_doc(updated_update)}, 200
+    db.commit()
+    return {"update": serialize_doc(update_doc)}, 200

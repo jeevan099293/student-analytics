@@ -1,12 +1,12 @@
 from datetime import datetime, timezone
 
-from bson import ObjectId
 from flask import Blueprint, request
 from flask_jwt_extended import get_jwt, jwt_required
 
 from ..auth import roles_required
 from ..db import get_db
-from ..utils import serialize_doc
+from ..models import College
+from ..utils import parse_uuid, serialize_doc
 
 colleges_bp = Blueprint("colleges", __name__)
 
@@ -19,10 +19,12 @@ def list_colleges():
     role = claims.get("role")
 
     if role == "college_admin":
-        college_id = claims.get("college_id")
-        colleges = list(db.colleges.find({"_id": ObjectId(college_id)}))
+        college_id = parse_uuid(claims.get("college_id"))
+        if not college_id:
+            return {"items": []}, 200
+        colleges = db.query(College).filter(College.id == college_id).all()
     else:
-        colleges = list(db.colleges.find())
+        colleges = db.query(College).all()
 
     return {"items": [serialize_doc(c) for c in colleges]}, 200
 
@@ -36,17 +38,23 @@ def create_college():
     if any(not data.get(field) for field in required):
         return {"message": "Missing required fields"}, 400
 
-    payload = {
-        "name": data["name"].strip(),
-        "location": data["location"].strip(),
-        "admin_ids": [ObjectId(aid) for aid in data.get("admin_ids", [])],
-        "created_at": datetime.now(timezone.utc),
-    }
+    admin_ids = []
+    for aid in data.get("admin_ids", []):
+        parsed = parse_uuid(aid)
+        if not parsed:
+            return {"message": "Invalid admin_id in admin_ids"}, 400
+        admin_ids.append(parsed)
 
-    result = db.colleges.insert_one(payload)
-    payload["_id"] = result.inserted_id
-    payload = serialize_doc(payload)
-    return {"item": payload}, 201
+    college = College(
+        name=data["name"].strip(),
+        location=data["location"].strip(),
+        admin_ids=admin_ids,
+        created_at=datetime.now(timezone.utc),
+    )
+
+    db.add(college)
+    db.commit()
+    return {"item": serialize_doc(college)}, 201
 
 
 @colleges_bp.put("/<college_id>")
@@ -61,24 +69,41 @@ def update_college(college_id):
     if "location" in data:
         updates["location"] = data["location"].strip()
     if "admin_ids" in data:
-        updates["admin_ids"] = [ObjectId(aid) for aid in data["admin_ids"]]
+        admin_ids = []
+        for aid in data["admin_ids"]:
+            parsed = parse_uuid(aid)
+            if not parsed:
+                return {"message": "Invalid admin_id in admin_ids"}, 400
+            admin_ids.append(parsed)
+        updates["admin_ids"] = admin_ids
 
     if not updates:
         return {"message": "No fields to update"}, 400
 
-    result = db.colleges.update_one({"_id": ObjectId(college_id)}, {"$set": updates})
-    if result.matched_count == 0:
+    college_uuid = parse_uuid(college_id)
+    if not college_uuid:
+        return {"message": "Invalid college_id"}, 400
+
+    college = db.query(College).filter(College.id == college_uuid).first()
+    if not college:
         return {"message": "College not found"}, 404
 
-    college = serialize_doc(db.colleges.find_one({"_id": ObjectId(college_id)}))
-    return {"item": college}, 200
+    for key, value in updates.items():
+        setattr(college, key, value)
+    db.commit()
+    return {"item": serialize_doc(college)}, 200
 
 
 @colleges_bp.delete("/<college_id>")
 @roles_required("super_admin")
 def delete_college(college_id):
     db = get_db()
-    result = db.colleges.delete_one({"_id": ObjectId(college_id)})
-    if result.deleted_count == 0:
+    college_uuid = parse_uuid(college_id)
+    if not college_uuid:
+        return {"message": "Invalid college_id"}, 400
+    college = db.query(College).filter(College.id == college_uuid).first()
+    if not college:
         return {"message": "College not found"}, 404
+    db.delete(college)
+    db.commit()
     return {"message": "College deleted"}, 200

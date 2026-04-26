@@ -1,8 +1,11 @@
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Optional, Tuple
+from uuid import UUID
 
-from bson import ObjectId
+from sqlalchemy.inspection import inspect
+
+from .models import Notification, Student
 
 
 DISCIPLINE_JUSTIFICATION_CATEGORIES = [
@@ -111,7 +114,7 @@ def classify_discipline_update(delta: dict, config) -> tuple[bool, bool, list[st
 
 
 def _make_json_safe(value):
-    if isinstance(value, ObjectId):
+    if isinstance(value, UUID):
         return str(value)
     if isinstance(value, datetime):
         return value.isoformat()
@@ -122,13 +125,29 @@ def _make_json_safe(value):
     return value
 
 
+def model_to_dict(instance):
+    if instance is None:
+        return None
+    data = {c.key: getattr(instance, c.key) for c in inspect(instance).mapper.column_attrs}
+    return data
+
+
+def parse_uuid(value: str):
+    try:
+        return UUID(str(value))
+    except Exception:
+        return None
+
+
 def serialize_doc(doc):
     if not doc:
         return None
+    if hasattr(doc, "__table__"):
+        return _make_json_safe(model_to_dict(doc))
     return _make_json_safe(doc)
 
 
-def append_score_history(student: dict, updated_by: ObjectId, reason: str = "manual_update") -> dict:
+def append_score_history(student: dict, updated_by, reason: str = "manual_update") -> dict:
     history_entry = {
         "timestamp": datetime.now(timezone.utc),
         "updated_by": updated_by,
@@ -146,70 +165,50 @@ def append_score_history(student: dict, updated_by: ObjectId, reason: str = "man
 
 
 def create_notification(db, student: dict, message: str, event_type: str = "score_update"):
-    db.notifications.insert_one(
-        {
-            "student_id": student.get("_id"),
-            "college_id": student.get("college_id"),
-            "message": message,
-            "event_type": event_type,
-            "is_read": False,
-            "created_at": datetime.now(timezone.utc),
-        }
+    notification = Notification(
+        student_id=student.get("id"),
+        college_id=student.get("college_id"),
+        message=message,
+        event_type=event_type,
+        is_read=False,
+        created_at=datetime.now(timezone.utc),
     )
+    db.add(notification)
 
 
 def recalculate_ranks(db):
-    students_collection = db.students
-    students = list(
-        students_collection.find(
-            {},
-            {
-                "_id": 1,
-                "college_id": 1,
-                "department": 1,
-                "discipline_score": 1,
-                "name": 1,
-            },
-        )
-    )
+    students = db.query(Student).all()
 
     sorted_global = sorted(
         students,
-        key=lambda s: (-s.get("discipline_score", 0), s.get("name", "")),
+        key=lambda s: (-float(s.discipline_score or 0), s.name or ""),
     )
 
     for rank, student in enumerate(sorted_global, start=1):
-        students_collection.update_one(
-            {"_id": student["_id"]},
-            {"$set": {"rank_global": rank}},
-        )
+        student.rank_global = rank
 
     college_groups = defaultdict(list)
     department_groups = defaultdict(list)
     for student in students:
-        college_groups[str(student.get("college_id"))].append(student)
+        college_groups[str(student.college_id)].append(student)
         department_groups[
-            f"{student.get('college_id')}::{student.get('department', '').strip().lower()}"
+            f"{student.college_id}::{(student.department or '').strip().lower()}"
         ].append(student)
 
     for group_students in college_groups.values():
         ranked = sorted(
             group_students,
-            key=lambda s: (-s.get("discipline_score", 0), s.get("name", "")),
+            key=lambda s: (-float(s.discipline_score or 0), s.name or ""),
         )
         for rank, student in enumerate(ranked, start=1):
-            students_collection.update_one(
-                {"_id": student["_id"]},
-                {"$set": {"rank_college": rank}},
-            )
+            student.rank_college = rank
 
     for group_students in department_groups.values():
         ranked = sorted(
             group_students,
-            key=lambda s: (-s.get("discipline_score", 0), s.get("name", "")),
+            key=lambda s: (-float(s.discipline_score or 0), s.name or ""),
         )
         for rank, student in enumerate(ranked, start=1):
-            students_collection.update_one(
-                {"_id": student["_id"]},
-                {"$set": {"rank_department": rank}},
-            )
+            student.rank_department = rank
+
+    db.commit()

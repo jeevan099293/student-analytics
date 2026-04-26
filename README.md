@@ -6,7 +6,7 @@ Full-stack web application to track and rank students across schools/colleges us
 
 - Frontend: React.js + Tailwind CSS + Axios + Recharts
 - Backend: Python Flask + JWT + Role-Based Access Control
-- Database: MongoDB
+- Database: Supabase Postgres
 
 ## Discipline Score Formula
 
@@ -97,6 +97,8 @@ pip install -r requirements.txt
 copy .env.example .env
 ```
 
+Edit `.env` and set `DATABASE_URL` from your Supabase project settings.
+
 3. Run backend:
 
 ```bash
@@ -121,7 +123,11 @@ If needed, set API base URL:
 set VITE_API_URL=http://localhost:5000/api
 ```
 
-## MongoDB Collections and Schema
+## Postgres Schema (Supabase)
+
+Schema is defined in [backend/app/models.py](backend/app/models.py).
+
+Legacy MongoDB schema (for reference only):
 
 ### 1) Students Collection
 

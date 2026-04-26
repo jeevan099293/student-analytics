@@ -3,9 +3,9 @@ from pathlib import Path
 from flask import Flask, send_from_directory
 from flask_cors import CORS
 from flask_jwt_extended import JWTManager
-from pymongo import ASCENDING, DESCENDING
-
 from .config import Config
+from .db import close_db, engine
+from .models import Base
 from .routes.admins_routes import admins_bp
 from .routes.analytics_routes import analytics_bp
 from .routes.auth_routes import auth_bp
@@ -25,6 +25,9 @@ def create_app() -> Flask:
     CORS(app)
     JWTManager(app)
 
+    Base.metadata.create_all(bind=engine)
+    app.teardown_appcontext(close_db)
+
     app.register_blueprint(auth_bp, url_prefix="/api/auth")
     app.register_blueprint(colleges_bp, url_prefix="/api/colleges")
     app.register_blueprint(admins_bp, url_prefix="/api/admins")
@@ -33,24 +36,6 @@ def create_app() -> Flask:
     app.register_blueprint(leaderboard_bp, url_prefix="/api/leaderboard")
     app.register_blueprint(analytics_bp, url_prefix="/api/analytics")
     app.register_blueprint(notifications_bp, url_prefix="/api/notifications")
-
-    with app.app_context():
-        from .db import get_db
-
-        db = get_db()
-        db.students.create_index([("college_id", ASCENDING), ("roll_number", ASCENDING)], unique=True)
-        db.students.create_index([("discipline_score", DESCENDING)])
-        db.students.create_index([("college_id", ASCENDING), ("department", ASCENDING)])
-        db.students.create_index([("year", ASCENDING)])
-        db.students.create_index([("name", ASCENDING)])
-        db.admins.create_index([("email", ASCENDING)], unique=True)
-        db.colleges.create_index([("name", ASCENDING)], unique=True)
-        db.notifications.create_index([("college_id", ASCENDING), ("is_read", ASCENDING)])
-        db.notifications.create_index([("created_at", DESCENDING)])
-
-        db.discipline_updates.create_index([("student_id", ASCENDING), ("created_at", DESCENDING)])
-        db.discipline_updates.create_index([("college_id", ASCENDING), ("status", ASCENDING), ("created_at", DESCENDING)])
-        db.discipline_updates.create_index([("status", ASCENDING), ("created_at", DESCENDING)])
 
     @app.get("/api/health")
     def health_check():

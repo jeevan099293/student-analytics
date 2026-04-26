@@ -1,14 +1,22 @@
-from functools import lru_cache
-
-from pymongo import MongoClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import scoped_session, sessionmaker
 
 from .config import Config
 
 
-@lru_cache(maxsize=1)
-def get_client() -> MongoClient:
-    return MongoClient(Config.MONGO_URI)
+engine = create_engine(
+    Config.DATABASE_URL,
+    pool_pre_ping=True,
+)
+
+SessionLocal = scoped_session(
+    sessionmaker(autocommit=False, autoflush=False, bind=engine)
+)
 
 
 def get_db():
-    return get_client()[Config.MONGO_DB_NAME]
+    return SessionLocal()
+
+
+def close_db(exception=None):
+    SessionLocal.remove()

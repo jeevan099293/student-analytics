@@ -2,16 +2,17 @@ import csv
 import io
 from datetime import datetime, timezone
 
-from bson import ObjectId
 from flask import Blueprint, request
 from flask_jwt_extended import get_jwt, get_jwt_identity, jwt_required
+from sqlalchemy import or_
 
 from ..auth import roles_required
 from ..db import get_db
+from ..models import College, DisciplineUpdate, Student
 from ..utils import (
-    calculate_discipline_score,
     create_notification,
     normalize_discipline_metrics,
+    parse_uuid,
     recalculate_ranks,
     serialize_doc,
     validate_justification,
@@ -22,8 +23,18 @@ students_bp = Blueprint("students", __name__)
 
 def _college_scope_filter(claims):
     if claims.get("role") == "college_admin":
-        return {"college_id": ObjectId(claims["college_id"])}, None
-    return {}, None
+        college_uuid = parse_uuid(claims.get("college_id"))
+        if not college_uuid:
+            return None, {"message": "Invalid college_id"}
+        return [Student.college_id == college_uuid], None
+    return [], None
+
+
+def _student_dict(student, college_name=None):
+    payload = serialize_doc(student)
+    if college_name is not None:
+        payload["college_name"] = college_name
+    return payload
 
 
 @students_bp.get("")
@@ -31,7 +42,9 @@ def _college_scope_filter(claims):
 def list_students():
     db = get_db()
     claims = get_jwt()
-    filters, _ = _college_scope_filter(claims)
+    filters, err = _college_scope_filter(claims)
+    if err:
+        return err, 400
 
     college_id = request.args.get("college_id")
     department = request.args.get("department")
@@ -39,33 +52,36 @@ def list_students():
     search = request.args.get("search")
 
     if college_id and claims.get("role") == "super_admin":
-        filters["college_id"] = ObjectId(college_id)
+        college_uuid = parse_uuid(college_id)
+        if not college_uuid:
+            return {"message": "Invalid college_id"}, 400
+        filters.append(Student.college_id == college_uuid)
     if department:
-        filters["department"] = department.strip()
+        filters.append(Student.department == department.strip())
     if year:
         try:
-            filters["year"] = int(year)
+            filters.append(Student.year == int(year))
         except ValueError:
             return {"message": "year must be a number"}, 400
     if search:
-        filters["$or"] = [
-            {"name": {"$regex": search, "$options": "i"}},
-            {"roll_number": {"$regex": search, "$options": "i"}},
-        ]
+        like = f"%{search}%"
+        filters.append(or_(Student.name.ilike(like), Student.roll_number.ilike(like)))
     if request.args.get("approved") in ["true", "false"]:
-        filters["approved"] = request.args.get("approved") == "true"
+        filters.append(Student.approved == (request.args.get("approved") == "true"))
 
-    items = list(db.students.find(filters))
-    college_ids = list({item.get("college_id") for item in items if item.get("college_id")})
-    colleges = {
-        c.get("_id"): c.get("name")
-        for c in db.colleges.find({"_id": {"$in": college_ids}}, {"name": 1})
-    }
+    items = db.query(Student).filter(*filters).all()
+    college_ids = list({item.college_id for item in items if item.college_id})
+    college_map = {}
+    if college_ids:
+        college_map = {
+            c.id: c.name for c in db.query(College).filter(College.id.in_(college_ids)).all()
+        }
+
+    results = []
     for item in items:
-        item["college_name"] = colleges.get(item.get("college_id"))
+        results.append(_student_dict(item, college_map.get(item.college_id)))
 
-    items = [serialize_doc(item) for item in items]
-    return {"items": items}, 200
+    return {"items": results}, 200
 
 
 @students_bp.post("")
@@ -83,6 +99,10 @@ def create_student():
     if not college_id:
         return {"message": "college_id is required"}, 400
 
+    college_uuid = parse_uuid(college_id)
+    if not college_uuid:
+        return {"message": "Invalid college_id"}, 400
+
     if claims.get("role") == "college_admin" and college_id != claims.get("college_id"):
         return {"message": "You can only create students in your college"}, 403
 
@@ -92,30 +112,41 @@ def create_student():
     participation = metrics["participation"]
     score = metrics["discipline_score"]
 
-    payload = {
-        "name": data["name"].strip(),
-        "roll_number": data["roll_number"].strip(),
-        "college_id": ObjectId(college_id),
-        "department": data["department"].strip(),
-        "year": int(data["year"]),
-        "bio": (data.get("bio") or "").strip(),
-        "contact_email": (data.get("contact_email") or "").strip() or None,
-        "contact_phone": (data.get("contact_phone") or "").strip() or None,
-        "attendance": attendance,
-        "behavior": behavior,
-        "participation": participation,
-        "achievements": data.get("achievements", []),
-        "discipline_score": score,
-        "rank_global": None,
-        "rank_college": None,
-        "rank_department": None,
-        "approved": False,
-        "approved_by": None,
-        "approved_at": None,
-        "history": [
+    if (
+        db.query(Student)
+        .filter(Student.roll_number == data["roll_number"].strip(), Student.college_id == college_uuid)
+        .first()
+    ):
+        return {"message": "Roll number already exists in this college"}, 409
+
+    admin_id = parse_uuid(get_jwt_identity())
+    if not admin_id:
+        return {"message": "Invalid admin id"}, 400
+
+    payload = Student(
+        name=data["name"].strip(),
+        roll_number=data["roll_number"].strip(),
+        college_id=college_uuid,
+        department=data["department"].strip(),
+        year=int(data["year"]),
+        bio=(data.get("bio") or "").strip() or None,
+        contact_email=(data.get("contact_email") or "").strip() or None,
+        contact_phone=(data.get("contact_phone") or "").strip() or None,
+        attendance=attendance,
+        behavior=behavior,
+        participation=participation,
+        achievements=data.get("achievements", []),
+        discipline_score=score,
+        rank_global=None,
+        rank_college=None,
+        rank_department=None,
+        approved=False,
+        approved_by=None,
+        approved_at=None,
+        history=[
             {
                 "timestamp": datetime.now(timezone.utc),
-                "updated_by": ObjectId(get_jwt_identity()),
+                "updated_by": str(admin_id),
                 "reason": "created",
                 "category": "Other",
                 "previous": {},
@@ -127,59 +158,63 @@ def create_student():
                 },
             }
         ],
-        "created_at": datetime.now(timezone.utc),
-        "updated_at": datetime.now(timezone.utc),
-    }
-
-    if db.students.find_one({"roll_number": payload["roll_number"], "college_id": payload["college_id"]}):
-        return {"message": "Roll number already exists in this college"}, 409
-
-    result = db.students.insert_one(payload)
-    payload["_id"] = result.inserted_id
-
-    # Immutable discipline audit record (for full accountability)
-    db.discipline_updates.insert_one(
-        {
-            "student_id": payload["_id"],
-            "college_id": payload["college_id"],
-            "created_at": datetime.now(timezone.utc),
-            "created_by": {
-                "id": ObjectId(get_jwt_identity()),
-                "name": claims.get("name"),
-                "role": claims.get("role"),
-            },
-            "category": "Other",
-            "reason": "created",
-            "details": None,
-            "previous": {},
-            "new": {
-                "attendance": attendance,
-                "behavior": behavior,
-                "participation": participation,
-                "discipline_score": score,
-            },
-            "delta": {
-                "attendance": attendance,
-                "behavior": behavior,
-                "participation": participation,
-                "discipline_score": score,
-            },
-            "requires_approval": False,
-            "status": "applied",
-            "reviewed_by": None,
-            "reviewed_at": None,
-            "applied_at": datetime.now(timezone.utc),
-            "suspicious": False,
-            "suspicious_flags": [],
-        }
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
     )
+
+    db.add(payload)
+    db.flush()
+
+    update_doc = DisciplineUpdate(
+        student_id=payload.id,
+        college_id=payload.college_id,
+        department=payload.department,
+        year=payload.year,
+        created_at=datetime.now(timezone.utc),
+        created_by={
+            "id": str(admin_id),
+            "name": claims.get("name"),
+            "role": claims.get("role"),
+        },
+        category="Other",
+        reason="created",
+        details=None,
+        previous={},
+        new={
+            "attendance": attendance,
+            "behavior": behavior,
+            "participation": participation,
+            "discipline_score": score,
+        },
+        delta={
+            "attendance": attendance,
+            "behavior": behavior,
+            "participation": participation,
+            "discipline_score": score,
+        },
+        new_behavior=behavior,
+        new_discipline_score=score,
+        delta_behavior=behavior,
+        delta_discipline_score=score,
+        requires_approval=False,
+        status="applied",
+        reviewed_by=None,
+        reviewed_at=None,
+        applied_at=datetime.now(timezone.utc),
+        suspicious=False,
+        suspicious_flags=[],
+    )
+
+    db.add(update_doc)
     create_notification(
         db,
-        payload,
-        f"New student record created for {payload['name']} ({payload['roll_number']}).",
+        {"id": payload.id, "college_id": payload.college_id},
+        f"New student record created for {payload.name} ({payload.roll_number}).",
         event_type="student_created",
     )
+    db.commit()
     recalculate_ranks(db)
+
     return {"item": serialize_doc(payload)}, 201
 
 
@@ -188,38 +223,44 @@ def create_student():
 def get_student(student_id):
     db = get_db()
     claims = get_jwt() if request.headers.get("Authorization") else {}
-    student = db.students.find_one({"_id": ObjectId(student_id)})
+    student_uuid = parse_uuid(student_id)
+    if not student_uuid:
+        return {"message": "Invalid student id"}, 400
+
+    student = db.query(Student).filter(Student.id == student_uuid).first()
     if not student:
         return {"message": "Student not found"}, 404
 
-    college = None
-    if student.get("college_id"):
-        college = db.colleges.find_one({"_id": student.get("college_id")}, {"name": 1})
-    student["college_name"] = (college or {}).get("name")
+    college_name = None
+    if student.college_id:
+        from ..models import College
 
-    if claims.get("role") == "college_admin" and str(student["college_id"]) != claims.get("college_id"):
+        college = db.query(College).filter(College.id == student.college_id).first()
+        college_name = college.name if college else None
+
+    if claims.get("role") == "college_admin" and str(student.college_id) != claims.get("college_id"):
         return {"message": "Forbidden"}, 403
 
     if not claims:
         public_fields = {
-            "_id": student["_id"],
-            "name": student.get("name"),
-            "department": student.get("department"),
-            "year": student.get("year"),
-            "college_id": student.get("college_id"),
-            "college_name": student.get("college_name"),
-            "bio": student.get("bio"),
-            "contact_email": student.get("contact_email"),
-            "contact_phone": student.get("contact_phone"),
-            "discipline_score": student.get("discipline_score"),
-            "rank_global": student.get("rank_global"),
-            "rank_college": student.get("rank_college"),
-            "rank_department": student.get("rank_department"),
-            "behavior": student.get("behavior"),
+            "id": student.id,
+            "name": student.name,
+            "department": student.department,
+            "year": student.year,
+            "college_id": student.college_id,
+            "college_name": college_name,
+            "bio": student.bio,
+            "contact_email": student.contact_email,
+            "contact_phone": student.contact_phone,
+            "discipline_score": student.discipline_score,
+            "rank_global": student.rank_global,
+            "rank_college": student.rank_college,
+            "rank_department": student.rank_department,
+            "behavior": student.behavior,
         }
         return {"item": serialize_doc(public_fields)}, 200
 
-    return {"item": serialize_doc(student)}, 200
+    return {"item": _student_dict(student, college_name)}, 200
 
 
 @students_bp.put("/<student_id>")
@@ -227,14 +268,17 @@ def get_student(student_id):
 def update_student(student_id):
     db = get_db()
     claims = get_jwt()
-    admin_id = ObjectId(get_jwt_identity())
     data = request.get_json(silent=True) or {}
 
-    student = db.students.find_one({"_id": ObjectId(student_id)})
+    student_uuid = parse_uuid(student_id)
+    if not student_uuid:
+        return {"message": "Invalid student id"}, 400
+
+    student = db.query(Student).filter(Student.id == student_uuid).first()
     if not student:
         return {"message": "Student not found"}, 404
 
-    if claims.get("role") == "college_admin" and str(student["college_id"]) != claims.get("college_id"):
+    if claims.get("role") == "college_admin" and str(student.college_id) != claims.get("college_id"):
         return {"message": "Forbidden"}, 403
 
     updates = {}
@@ -249,14 +293,21 @@ def update_student(student_id):
         }, 400
 
     if claims.get("role") == "super_admin" and "college_id" in data:
-        updates["college_id"] = ObjectId(data["college_id"])
+        college_uuid = parse_uuid(data["college_id"])
+        if not college_uuid:
+            return {"message": "Invalid college_id"}, 400
+        updates["college_id"] = college_uuid
 
     updates["updated_at"] = datetime.now(timezone.utc)
-    db.students.update_one({"_id": ObjectId(student_id)}, {"$set": updates})
+    for key, value in updates.items():
+        setattr(student, key, value)
+
+    db.commit()
     recalculate_ranks(db)
 
-    updated = db.students.find_one({"_id": ObjectId(student_id)})
+    updated = db.query(Student).filter(Student.id == student_uuid).first()
     return {"item": serialize_doc(updated)}, 200
+
 
 @students_bp.put("/me")
 def student_self_update():
@@ -266,7 +317,11 @@ def student_self_update():
     if not student_id:
         return {"message": "student_id is required"}, 400
 
-    student = db.students.find_one({"_id": ObjectId(student_id)})
+    student_uuid = parse_uuid(student_id)
+    if not student_uuid:
+        return {"message": "Invalid student id"}, 400
+
+    student = db.query(Student).filter(Student.id == student_uuid).first()
     if not student:
         return {"message": "Student not found"}, 404
 
@@ -279,8 +334,10 @@ def student_self_update():
         return {"message": "No fields to update"}, 400
 
     updates["updated_at"] = datetime.now(timezone.utc)
-    db.students.update_one({"_id": ObjectId(student_id)}, {"$set": updates})
+    for key, value in updates.items():
+        setattr(student, key, value)
 
+    db.commit()
     return {"message": "Profile updated successfully"}, 200
 
 
@@ -289,19 +346,25 @@ def student_self_update():
 def delete_student(student_id):
     db = get_db()
     claims = get_jwt()
-    student = db.students.find_one({"_id": ObjectId(student_id)})
+
+    student_uuid = parse_uuid(student_id)
+    if not student_uuid:
+        return {"message": "Invalid student id"}, 400
+
+    student = db.query(Student).filter(Student.id == student_uuid).first()
     if not student:
         return {"message": "Student not found"}, 404
-    if claims.get("role") == "college_admin" and str(student["college_id"]) != claims.get("college_id"):
+    if claims.get("role") == "college_admin" and str(student.college_id) != claims.get("college_id"):
         return {"message": "Forbidden"}, 403
 
-    db.students.delete_one({"_id": ObjectId(student_id)})
     create_notification(
         db,
-        student,
-        f"Student record deleted for {student.get('name')}.",
+        {"id": student.id, "college_id": student.college_id},
+        f"Student record deleted for {student.name}.",
         event_type="student_deleted",
     )
+    db.delete(student)
+    db.commit()
     recalculate_ranks(db)
     return {"message": "Student deleted"}, 200
 
@@ -311,7 +374,9 @@ def delete_student(student_id):
 def bulk_upload_students():
     db = get_db()
     claims = get_jwt()
-    admin_id = ObjectId(get_jwt_identity())
+    admin_id = parse_uuid(get_jwt_identity())
+    if not admin_id:
+        return {"message": "Invalid admin id"}, 400
 
     if "file" not in request.files:
         return {"message": "CSV file is required"}, 400
@@ -323,6 +388,13 @@ def bulk_upload_students():
     inserted_count = 0
     for row in reader:
         college_id = row.get("college_id") or claims.get("college_id")
+        if not college_id:
+            continue
+
+        college_uuid = parse_uuid(college_id)
+        if not college_uuid:
+            continue
+
         if claims.get("role") == "college_admin" and college_id != claims.get("college_id"):
             continue
 
@@ -332,24 +404,24 @@ def bulk_upload_students():
         participation = metrics["participation"]
         score = metrics["discipline_score"]
 
-        payload = {
-            "name": row.get("name", "").strip(),
-            "roll_number": row.get("roll_number", "").strip(),
-            "college_id": ObjectId(college_id),
-            "department": row.get("department", "General").strip(),
-            "year": int(row.get("year", 1)),
-            "attendance": attendance,
-            "behavior": behavior,
-            "participation": participation,
-            "discipline_score": score,
-            "rank_global": None,
-            "rank_college": None,
-            "rank_department": None,
-            "achievements": [],
-            "history": [
+        payload = Student(
+            name=row.get("name", "").strip(),
+            roll_number=row.get("roll_number", "").strip(),
+            college_id=college_uuid,
+            department=row.get("department", "General").strip(),
+            year=int(row.get("year", 1)),
+            attendance=attendance,
+            behavior=behavior,
+            participation=participation,
+            discipline_score=score,
+            rank_global=None,
+            rank_college=None,
+            rank_department=None,
+            achievements=[],
+            history=[
                 {
                     "timestamp": datetime.now(timezone.utc),
-                    "updated_by": admin_id,
+                    "updated_by": str(admin_id),
                     "reason": "bulk_upload",
                     "category": "Other",
                     "previous": {},
@@ -361,60 +433,70 @@ def bulk_upload_students():
                     },
                 }
             ],
-            "created_at": datetime.now(timezone.utc),
-            "updated_at": datetime.now(timezone.utc),
-        }
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
 
-        if payload["name"] and payload["roll_number"]:
-            if not db.students.find_one(
-                {"roll_number": payload["roll_number"], "college_id": payload["college_id"]}
-            ):
-                insert_result = db.students.insert_one(payload)
-                payload["_id"] = insert_result.inserted_id
+        if payload.name and payload.roll_number:
+            existing = (
+                db.query(Student)
+                .filter(Student.roll_number == payload.roll_number, Student.college_id == payload.college_id)
+                .first()
+            )
+            if not existing:
+                db.add(payload)
+                db.flush()
 
-                db.discipline_updates.insert_one(
-                    {
-                        "student_id": payload["_id"],
-                        "college_id": payload["college_id"],
-                        "created_at": datetime.now(timezone.utc),
-                        "created_by": {
-                            "id": admin_id,
+                db.add(
+                    DisciplineUpdate(
+                        student_id=payload.id,
+                        college_id=payload.college_id,
+                        department=payload.department,
+                        year=payload.year,
+                        created_at=datetime.now(timezone.utc),
+                        created_by={
+                            "id": str(admin_id),
                             "name": claims.get("name"),
                             "role": claims.get("role"),
                         },
-                        "category": "Other",
-                        "reason": "bulk_upload",
-                        "details": None,
-                        "previous": {},
-                        "new": {
+                        category="Other",
+                        reason="bulk_upload",
+                        details=None,
+                        previous={},
+                        new={
                             "attendance": attendance,
                             "behavior": behavior,
                             "participation": participation,
                             "discipline_score": score,
                         },
-                        "delta": {
+                        delta={
                             "attendance": attendance,
                             "behavior": behavior,
                             "participation": participation,
                             "discipline_score": score,
                         },
-                        "requires_approval": False,
-                        "status": "applied",
-                        "reviewed_by": None,
-                        "reviewed_at": None,
-                        "applied_at": datetime.now(timezone.utc),
-                        "suspicious": False,
-                        "suspicious_flags": [],
-                    }
+                        new_behavior=behavior,
+                        new_discipline_score=score,
+                        delta_behavior=behavior,
+                        delta_discipline_score=score,
+                        requires_approval=False,
+                        status="applied",
+                        reviewed_by=None,
+                        reviewed_at=None,
+                        applied_at=datetime.now(timezone.utc),
+                        suspicious=False,
+                        suspicious_flags=[],
+                    )
                 )
                 create_notification(
                     db,
-                    payload,
-                    f"Student {payload['name']} was added via CSV bulk upload.",
+                    {"id": payload.id, "college_id": payload.college_id},
+                    f"Student {payload.name} was added via CSV bulk upload.",
                     event_type="bulk_upload",
                 )
                 inserted_count += 1
 
+    db.commit()
     recalculate_ranks(db)
     return {"message": "Bulk upload completed", "inserted_count": inserted_count}, 200
 
@@ -429,7 +511,6 @@ def reset_scores():
     if err:
         return {"message": err}, 400
 
-    filters = {}
     college_id = (data.get("college_id") or "").strip()
     roll_number = (data.get("roll_number") or "").strip()
 
@@ -439,104 +520,107 @@ def reset_scores():
     if claims.get("role") == "college_admin" and college_id != claims.get("college_id"):
         return {"message": "You can only reset scores in your college"}, 403
 
-    try:
-        filters["college_id"] = ObjectId(college_id)
-    except Exception:
+    college_uuid = parse_uuid(college_id)
+    if not college_uuid:
         return {"message": "Invalid college_id"}, 400
 
-    filters["roll_number"] = roll_number
-
-    students = list(db.students.find(filters))
+    students = (
+        db.query(Student)
+        .filter(Student.college_id == college_uuid, Student.roll_number == roll_number)
+        .all()
+    )
     if not students:
         return {"message": "No student found for provided college and roll number"}, 404
 
+    admin_id = parse_uuid(get_jwt_identity())
+    if not admin_id:
+        return {"message": "Invalid admin id"}, 400
+
     for student in students:
         applied_at = datetime.now(timezone.utc)
-        previous = normalize_discipline_metrics({}, fallback=student)
-        admin_id = ObjectId(get_jwt_identity())
+        previous = normalize_discipline_metrics({}, fallback=serialize_doc(student))
 
-        db.students.update_one(
-            {"_id": student["_id"]},
+        student.attendance = 0
+        student.behavior = 0
+        student.participation = 0
+        student.discipline_score = 0
+        student.updated_at = applied_at
+        history = list(student.history or [])
+        history.append(
             {
-                "$set": {
-                    "attendance": 0,
-                    "behavior": 0,
-                    "participation": 0,
-                    "discipline_score": 0,
-                    "updated_at": applied_at,
-                },
-                "$push": {
-                    "history": {
-                        "timestamp": applied_at,
-                        "updated_by": admin_id,
-                        "reason": justification["reason"],
-                        "category": justification["category"],
-                        "details": justification.get("details"),
-                        "previous": {
-                            "attendance": student.get("attendance", 0),
-                            "behavior": student.get("behavior", 0),
-                            "participation": student.get("participation", 0),
-                            "discipline_score": student.get("discipline_score", 0),
-                        },
-                        "new": {
-                            "attendance": 0,
-                            "behavior": 0,
-                            "participation": 0,
-                            "discipline_score": 0,
-                        },
-                    }
-                },
-            },
-        )
-
-        db.discipline_updates.insert_one(
-            {
-                "student_id": student.get("_id"),
-                "college_id": student.get("college_id"),
-                "created_at": applied_at,
-                "created_by": {
-                    "id": admin_id,
-                    "name": claims.get("name"),
-                    "role": claims.get("role"),
-                },
-                "category": justification["category"],
+                "timestamp": applied_at,
+                "updated_by": str(admin_id),
                 "reason": justification["reason"],
+                "category": justification["category"],
                 "details": justification.get("details"),
-                "previous": previous,
+                "previous": {
+                    "attendance": previous.get("attendance", 0),
+                    "behavior": previous.get("behavior", 0),
+                    "participation": previous.get("participation", 0),
+                    "discipline_score": previous.get("discipline_score", 0),
+                },
                 "new": {
                     "attendance": 0,
                     "behavior": 0,
                     "participation": 0,
                     "discipline_score": 0,
                 },
-                "delta": {
+            }
+        )
+        student.history = history
+
+        db.add(
+            DisciplineUpdate(
+                student_id=student.id,
+                college_id=student.college_id,
+                department=student.department,
+                year=student.year,
+                created_at=applied_at,
+                created_by={
+                    "id": str(admin_id),
+                    "name": claims.get("name"),
+                    "role": claims.get("role"),
+                },
+                category=justification["category"],
+                reason=justification["reason"],
+                details=justification.get("details"),
+                previous=previous,
+                new={
+                    "attendance": 0,
+                    "behavior": 0,
+                    "participation": 0,
+                    "discipline_score": 0,
+                },
+                delta={
                     "attendance": -previous.get("attendance", 0),
                     "behavior": -previous.get("behavior", 0),
                     "participation": -previous.get("participation", 0),
                     "discipline_score": -previous.get("discipline_score", 0),
                 },
-                "requires_approval": False,
-                "status": "applied",
-                "reviewed_by": None,
-                "reviewed_at": None,
-                "applied_at": applied_at,
-                "suspicious": False,
-                "suspicious_flags": [],
-            }
+                new_behavior=0,
+                new_discipline_score=0,
+                delta_behavior=-previous.get("behavior", 0),
+                delta_discipline_score=-previous.get("discipline_score", 0),
+                requires_approval=False,
+                status="applied",
+                reviewed_by=None,
+                reviewed_at=None,
+                applied_at=applied_at,
+                suspicious=False,
+                suspicious_flags=[],
+            )
         )
 
         create_notification(
             db,
-            student,
-            f"Scores reset for {student.get('name')}.",
+            {"id": student.id, "college_id": student.college_id},
+            f"Scores reset for {student.name}.",
             event_type="score_reset",
         )
 
+    db.commit()
     recalculate_ranks(db)
-    return {
-        "message": "Score reset successfully",
-        "count": len(students),
-    }, 200
+    return {"message": "Score reset successfully", "count": len(students)}, 200
 
 
 @students_bp.post("/<student_id>/approve")
@@ -544,39 +628,42 @@ def reset_scores():
 def approve_student(student_id):
     db = get_db()
     claims = get_jwt()
-    approver_id = ObjectId(get_jwt_identity())
+    approver_id = parse_uuid(get_jwt_identity())
+    if not approver_id:
+        return {"message": "Invalid admin id"}, 400
 
-    student = db.students.find_one({"_id": ObjectId(student_id)})
+    student_uuid = parse_uuid(student_id)
+    if not student_uuid:
+        return {"message": "Invalid student id"}, 400
+
+    student = db.query(Student).filter(Student.id == student_uuid).first()
     if not student:
         return {"message": "Student not found"}, 404
-    if claims.get("role") == "college_admin" and str(student["college_id"]) != claims.get("college_id"):
+    if claims.get("role") == "college_admin" and str(student.college_id) != claims.get("college_id"):
         return {"message": "Forbidden"}, 403
 
-    db.students.update_one(
-        {"_id": ObjectId(student_id)},
+    student.approved = True
+    student.approved_by = approver_id
+    student.approved_at = datetime.now(timezone.utc)
+    student.updated_at = datetime.now(timezone.utc)
+
+    history = list(student.history or [])
+    history.append(
         {
-            "$set": {
-                "approved": True,
-                "approved_by": approver_id,
-                "approved_at": datetime.now(timezone.utc),
-                "updated_at": datetime.now(timezone.utc),
-            },
-            "$push": {
-                "history": {
-                    "timestamp": datetime.now(timezone.utc),
-                    "updated_by": approver_id,
-                    "reason": "approved",
-                    "new": {"approved": True},
-                }
-            },
-        },
+            "timestamp": datetime.now(timezone.utc),
+            "updated_by": str(approver_id),
+            "reason": "approved",
+            "new": {"approved": True},
+        }
     )
+    student.history = history
 
     create_notification(
         db,
-        student,
-        f"Student profile approved for {student.get('name')}.",
+        {"id": student.id, "college_id": student.college_id},
+        f"Student profile approved for {student.name}.",
         event_type="student_approved",
     )
-    updated = db.students.find_one({"_id": ObjectId(student_id)})
+    db.commit()
+    updated = db.query(Student).filter(Student.id == student_uuid).first()
     return {"item": serialize_doc(updated)}, 200
